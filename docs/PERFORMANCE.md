@@ -184,8 +184,9 @@ the proxy cost is quantified.
   RX 7900 XTX log showed 30.8 MiB/s direct reads but 5.4 GiB/s direct writes.
   Staged-read mode smoke-tested under Wine/lavapipe; real-hardware rerun needed.
 - 2026-10-21: attached `gpuvramdisk-bench.exe` as a separate asset to the
-  existing `v0.9.1` release and refreshed `SHA256SUMS`. The tagged archives were
-  left unchanged; the benchmark asset was built from `1bf3cfa`.
+  existing `v0.9.1` release and refreshed `SHA256SUMS`. The asset was later
+  rebuilt from `ba5615b` to include staged reads. The tagged archives were left
+  unchanged.
 - 2026-10-21, `1bf3cfa`: added `gpuvramdisk-bench` for raw Vulkan and
   shared-memory proxy measurements. Built cleanly with MinGW-w64; `--help`,
   raw, and proxy modes smoke-tested under Wine/lavapipe.
