@@ -20,7 +20,7 @@ public:
     MainWindow(const MainWindow&) = delete;
     MainWindow& operator=(const MainWindow&) = delete;
 
-    bool create(bool startHidden);
+    bool create(bool startHidden, std::wstring& error);
     int runMessageLoop();
 
 private:

@@ -103,12 +103,16 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam,
     auto* self =
         reinterpret_cast<MainWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (self != nullptr) {
+        if (message == WM_NCCREATE) {
+            self->hwnd_ = hwnd;
+        }
         return self->handleMessage(message, wParam, lParam);
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
-bool MainWindow::create(bool startHidden) {
+bool MainWindow::create(bool startHidden, std::wstring& error) {
+    error.clear();
     startHidden_ = startHidden;
     icon_ = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP));
     if (icon_ == nullptr) {
@@ -127,6 +131,7 @@ bool MainWindow::create(bool startHidden) {
 
     if (RegisterClassExW(&windowClass) == 0 &&
         GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        error = L"Unable to register the main window class: " + lastError();
         return false;
     }
 
@@ -134,6 +139,7 @@ bool MainWindow::create(bool startHidden) {
                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                             1040, 720, nullptr, nullptr, instance_, this);
     if (hwnd_ == nullptr) {
+        error = L"Unable to create the main window: " + lastError();
         return false;
     }
 
@@ -141,9 +147,9 @@ bool MainWindow::create(bool startHidden) {
     createMenu();
     createControls();
 
-    std::wstring error;
-    if (!manager_.load(error)) {
-        showError(L"Unable to load the configuration:\n" + error);
+    std::wstring loadError;
+    if (!manager_.load(loadError)) {
+        showError(L"Unable to load the configuration:\n" + loadError);
     }
 
     populateStaticControls();
