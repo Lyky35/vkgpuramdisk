@@ -9,8 +9,10 @@ that follow from it.
 - `v0.9.1` is the current release.
 - The benchmark harness is `gpuvramdisk-bench` (`tools/bench.cpp`).
 - No optimized I/O path has been implemented yet.
-- No benchmark result from a real discrete GPU or a real ImDisk mount is checked
-  in yet. Wine with Mesa lavapipe is only a functional smoke test.
+- A real RX 7900 XTX run exposed pathological direct-mapped reads. The current
+  code now keeps direct writes but stages reads through the GPU copy engine on
+  discrete GPUs. That change still needs a real-hardware rerun.
+- Wine with Mesa lavapipe is only a functional smoke test.
 
 ## Running the benchmark
 
@@ -74,6 +76,34 @@ that drive design decisions.
 
 Reference: <https://spdk.io/doc/nvme_spec.html>
 
+## Measured baseline: RX 7900 XTX
+
+The first real-hardware run used direct-mapped VRAM and produced this:
+
+| Path | Sequential write | Sequential read | Random 4K write | Random 4K read |
+| --- | ---: | ---: | ---: | ---: |
+| Raw Vulkan | 5417 MiB/s | 30.8 MiB/s | 5421 MiB/s | 30.8 MiB/s |
+| Shared-memory proxy | 4284 MiB/s | 30.8 MiB/s | 861 MiB/s | 29.7 MiB/s |
+
+The read path is not hitting a bandwidth limit; it is hitting uncached BAR
+reads one cache line at a time. Writes use write-combining and are much faster.
+The proxy is not the read bottleneck because the proxy read result matches the
+raw result almost exactly.
+
+That run was captured before the staged-read change in `ba5615b`. On a direct
+mapped discrete GPU, writes remain CPU-to-BAR copies, while reads now go through
+a GPU copy into host-visible staging memory before the CPU copies them out.
+
+### About the 800 GB/s number
+
+The RX 7900 XTX has roughly 960 GB/s of *GPU-internal* memory bandwidth. That
+number does not apply to data crossing PCIe from the CPU. A CPU-to-VRAM copy is
+limited by the PCIe link (PCIe 4.0 x16 is about 32 GB/s theoretical, less in
+practice), and a disk I/O path also pays for the ImDisk copies and protocol.
+Reaching 800 GB/s over the disk interface would require the data to be consumed
+or produced entirely on the GPU, not read from and written to Windows through a
+CPU-visible block device.
+
 ## Current data path
 
 ```text
@@ -93,9 +123,25 @@ The likely costs, in order:
 4. Vulkan submission and fence wait per staged transfer.
 5. Uncached CPU reads when device-local memory is mapped directly.
 
-The last item is a hypothesis that must be measured. On a discrete GPU with
-resizable BAR, direct writes may be reasonable, while direct reads may be much
-slower than a GPU copy into host-visible staging memory.
+The last item is confirmed by the RX 7900 XTX baseline. On a discrete GPU with
+resizable BAR, direct writes can be fast enough to keep, while direct reads are
+much slower than a GPU copy into host-visible staging memory.
+
+The default policy is now:
+
+- Staged GPU memory: stage both reads and writes.
+- Direct-mapped integrated GPU: use direct CPU copies.
+- Direct-mapped discrete GPU: direct writes, staged reads.
+
+Force a mode for testing:
+
+```powershell
+$env:GPURAMDRIVE_DIRECT_READS = "1"   # force CPU reads from the BAR
+$env:GPURAMDRIVE_STAGED_READS = "1"   # force reads through the copy engine
+Remove-Item Env:\GPURAMDRIVE_DIRECT_READS, Env:\GPURAMDRIVE_STAGED_READS
+```
+
+If both override variables are set, staged reads win.
 
 ## Decision points
 
@@ -121,7 +167,7 @@ design cannot remove the per-I/O kernel/user round trip.
 
 | Candidate | Expected effect | Risk |
 | --- | --- | --- |
-| Direct-write plus staged-read policy | Avoid slow uncached BAR reads | Needs per-GPU validation |
+| Direct-write plus staged-read policy | Avoid slow uncached BAR reads | Implemented in `ba5615b`; needs real-hardware validation |
 | Batch Vulkan submissions | Less submit/fence overhead | Limited by synchronous proxy requests |
 | `VK_EXT_external_memory_host` import of proxy memory | Remove one CPU copy | Extension/pinning support varies |
 | Host write-back cache for small I/O | Absorb 4 KiB writes, flush in large batches | Cache coherence and unmount flush rules |
@@ -134,6 +180,9 @@ the proxy cost is quantified.
 
 ## Breadcrumb log
 
+- 2026-10-21, `ba5615b`: added the direct-write/staged-read policy after the
+  RX 7900 XTX log showed 30.8 MiB/s direct reads but 5.4 GiB/s direct writes.
+  Staged-read mode smoke-tested under Wine/lavapipe; real-hardware rerun needed.
 - 2026-10-21: attached `gpuvramdisk-bench.exe` as a separate asset to the
   existing `v0.9.1` release and refreshed `SHA256SUMS`. The tagged archives were
   left unchanged; the benchmark asset was built from `1bf3cfa`.

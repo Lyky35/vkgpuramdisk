@@ -125,8 +125,11 @@ the registering executable, otherwise it falls back to the CLI.
 
 On GPUs where device-local memory is host-visible, the drive is mapped
 directly. Otherwise it uses 256 MiB device-local segments and a 4 MiB
-host-visible staging buffer per transfer. Set
-`GPURAMDRIVE_FORCE_STAGING=1` to force the staging path for testing.
+host-visible staging buffer per transfer. Direct-mapped discrete GPUs keep
+direct writes but stage reads through the GPU copy engine, because uncached
+BAR reads can be extremely slow. Set `GPURAMDRIVE_FORCE_STAGING=1` to force the
+staging path for testing, or use `GPURAMDRIVE_DIRECT_READS=1` /
+`GPURAMDRIVE_STAGED_READS=1` to override the read policy.
 
 The ImDisk wire protocol is the standard 4096-byte shared-memory header plus a
 4 MiB data area. The proxy reports 512-byte request alignment because the
