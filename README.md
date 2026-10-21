@@ -35,6 +35,8 @@ Outputs:
 
 - `build/gpuvramdrive.exe` — GUI, `requireAdministrator`.
 - `build/gpuvramdrive-cli.exe` — CLI, `asInvoker` plus explicit elevation checks.
+- `build/gpuvramdisk-bench.exe` — raw Vulkan and shared-memory proxy benchmark.
+  See `docs/PERFORMANCE.md` for the measurement method and current findings.
 
 Dependencies: CMake 3.20+, a C++20 MinGW-w64 toolchain, and the Vulkan headers
 under `third_party/Vulkan-Headers/include`. The executables do not import
