@@ -23,12 +23,12 @@ using grd::VulkanRuntime;
 
 constexpr uint64_t kMiB = 1024ull * 1024ull;
 constexpr uint64_t kSector = 4096;
-constexpr uint64_t kSequentialChunk = 1ull * kMiB;
 
 struct Options {
     uint32_t gpu = 0;
     uint64_t sizeMiB = 256;
     uint64_t randomOps = 32768;
+    uint64_t chunkMiB = 4;
     bool raw = true;
     bool proxy = true;
 };
@@ -114,6 +114,7 @@ void printUsage() {
         "  --gpu N       Vulkan GPU index (default 0)\n"
         "  --size MiB    drive size in MiB (default 256)\n"
         "  --ops N       random-I/O operation count (default 32768)\n"
+        "  --chunk MiB   sequential transfer size (default 4)\n"
         "  --raw-only    benchmark Vulkan storage without the proxy protocol\n"
         "  --proxy-only  benchmark only the shared-memory proxy path\n"
         "  --help        show this help\n"
@@ -176,6 +177,15 @@ bool parseOptions(int argc, char** argv, Options& options, bool& showHelp) {
             }
             continue;
         }
+        if (arg == "--chunk") {
+            const char* value = nextValue("--chunk");
+            if (value == nullptr || !parseBytes(value, options.chunkMiB) ||
+                options.chunkMiB == 0 || options.chunkMiB > 256) {
+                std::printf("Invalid --chunk value (1-256 MiB)\n");
+                return false;
+            }
+            continue;
+        }
 
         std::printf("Unknown option: %s\n", arg.c_str());
         return false;
@@ -195,20 +205,23 @@ uint64_t randomOffset(uint64_t& state, uint64_t driveSize, uint64_t length) {
 }
 
 void runRawBenchmarks(VulkanDrive& drive, const Options& options) {
-    std::vector<uint8_t> buffer(static_cast<size_t>(kSequentialChunk));
+    const uint64_t chunkBytes =
+        std::min<uint64_t>(options.chunkMiB * kMiB, drive.size());
+    std::vector<uint8_t> buffer(static_cast<size_t>(chunkBytes));
     fillPattern(buffer, 0x1234);
 
-    std::printf("\nRaw Vulkan storage (%s)\n",
-                drive.directMapped() ? "direct mapped" : "staged");
+    std::printf("\nRaw Vulkan storage (%s, %llu MiB transfers)\n",
+                drive.directMapped() ? "direct mapped" : "staged",
+                static_cast<unsigned long long>(chunkBytes / kMiB));
     const uint64_t sequentialBytes = drive.size();
     const uint64_t sequentialOps =
-        (sequentialBytes + kSequentialChunk - 1) / kSequentialChunk;
+        (sequentialBytes + chunkBytes - 1) / chunkBytes;
 
     Result write = measure(sequentialBytes, sequentialOps, [&] {
         for (uint64_t offset = 0; offset < sequentialBytes;
-             offset += kSequentialChunk) {
+             offset += chunkBytes) {
             const uint64_t length =
-                std::min<uint64_t>(kSequentialChunk, sequentialBytes - offset);
+                std::min<uint64_t>(chunkBytes, sequentialBytes - offset);
             drive.write(offset, buffer.data(), static_cast<size_t>(length));
         }
     });
@@ -216,9 +229,9 @@ void runRawBenchmarks(VulkanDrive& drive, const Options& options) {
 
     Result read = measure(sequentialBytes, sequentialOps, [&] {
         for (uint64_t offset = 0; offset < sequentialBytes;
-             offset += kSequentialChunk) {
+             offset += chunkBytes) {
             const uint64_t length =
-                std::min<uint64_t>(kSequentialChunk, sequentialBytes - offset);
+                std::min<uint64_t>(chunkBytes, sequentialBytes - offset);
             drive.read(offset, buffer.data(), static_cast<size_t>(length));
         }
     });
@@ -409,14 +422,15 @@ void runProxyBenchmarks(VulkanDrive& drive, const Options& options) {
         return;
     }
 
-    const uint64_t chunk = std::min<uint64_t>(grd::kProxyBufferSize,
-                                               kSequentialChunk);
+    const uint64_t chunk = std::min<uint64_t>(
+        grd::kProxyBufferSize, options.chunkMiB * kMiB);
     const uint64_t total = std::min<uint64_t>(drive.size(), 64ull * kMiB);
     const uint64_t sequentialOps = (total + chunk - 1) / chunk;
     std::vector<uint8_t> buffer(static_cast<size_t>(chunk));
     fillPattern(buffer, 0x9ABC);
 
-    std::printf("\nShared-memory proxy path\n");
+    std::printf("\nShared-memory proxy path (%llu MiB transfers)\n",
+                static_cast<unsigned long long>(chunk / kMiB));
     Result write = measure(total, sequentialOps, [&] {
         for (uint64_t offset = 0; offset < total; offset += chunk) {
             const uint64_t length =
@@ -509,9 +523,10 @@ int main(int argc, char** argv) {
     std::printf("vkgpuramdisk benchmark\n");
     std::printf("GPU %u: %ls (%ls)\n", options.gpu, device.name.c_str(),
                 device.typeName().c_str());
-    std::printf("Drive size: %llu MiB, random operations: %llu\n",
+    std::printf("Drive size: %llu MiB, random operations: %llu, chunk: %llu MiB\n",
                 static_cast<unsigned long long>(options.sizeMiB),
-                static_cast<unsigned long long>(options.randomOps));
+                static_cast<unsigned long long>(options.randomOps),
+                static_cast<unsigned long long>(options.chunkMiB));
 
     auto drive = runtime.createDrive(
         options.gpu, options.sizeMiB * kMiB, error);
