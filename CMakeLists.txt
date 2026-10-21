@@ -69,3 +69,10 @@ target_link_libraries(gpuvramdrive PRIVATE grd_core comctl32 comdlg32)
 target_link_options(gpuvramdrive PRIVATE
     -static -static-libgcc -static-libstdc++ -municode
 )
+
+add_executable(gpuvramdisk-bench tools/bench.cpp)
+target_compile_options(gpuvramdisk-bench PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(gpuvramdisk-bench PRIVATE grd_core)
+target_link_options(gpuvramdisk-bench PRIVATE
+    -static -static-libgcc -static-libstdc++
+)
