@@ -18,7 +18,9 @@ namespace grd {
 // byte-addressable range. On a discrete GPU the memory is usually not host
 // visible, so reads and writes are staged through a small host-visible buffer.
 // On an integrated GPU (or a discrete GPU with resizable BAR) the device-local
-// memory is mapped directly.
+// memory is mapped directly. Directly mapped VRAM is useful for CPU writes but
+// is often extremely slow for CPU reads, so discrete GPUs read through the GPU
+// copy engine instead.
 class VulkanDrive {
 public:
     static std::unique_ptr<VulkanDrive> create(VulkanApi& api,
@@ -60,6 +62,7 @@ private:
     void createCommandObjects();
     void allocateStorage(uint64_t sizeBytes);
     void allocateStagingBuffer();
+    void configureReadPath();
     void zeroStorage();
 
     uint32_t chooseMemoryType(uint32_t allowedBits, bool requireDeviceLocal);
@@ -99,6 +102,7 @@ private:
     uint64_t size_ = 0;
     bool direct_ = false;
     bool directCoherent_ = false;
+    bool stagedReads_ = false;
     uint32_t memoryTypeIndex_ = UINT32_MAX;
 
     std::vector<Segment> segments_;

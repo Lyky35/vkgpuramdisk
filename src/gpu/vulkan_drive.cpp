@@ -46,6 +46,12 @@ std::runtime_error vulkanFailure(const char* operation, VkResult result) {
                                           static_cast<int>(result)));
 }
 
+bool environmentFlag(const wchar_t* name) {
+    wchar_t value[8] = {};
+    return GetEnvironmentVariableW(name, value,
+                                   static_cast<DWORD>(std::size(value))) > 0;
+}
+
 }  // namespace
 
 std::unique_ptr<VulkanDrive> VulkanDrive::create(VulkanApi& api,
@@ -100,16 +106,19 @@ void VulkanDrive::initialize(uint64_t sizeBytes) {
     createLogicalDevice();
     createCommandObjects();
     allocateStorage(size_);
+    configureReadPath();
 
-    if (!direct_) {
+    if (!direct_ || stagedReads_) {
         allocateStagingBuffer();
     }
 
     zeroStorage();
 
-    infoText_ = std::format(L"{} ({}), {} MiB, {}", info_.name, info_.typeName(),
-                            size_ / kMiB,
-                            direct_ ? L"direct mapped" : L"staged over PCIe");
+    const wchar_t* mode = !direct_        ? L"staged over PCIe"
+                          : stagedReads_ ? L"direct writes, staged reads"
+                                         : L"direct mapped";
+    infoText_ = std::format(L"{} ({}), {} MiB, {}", info_.name,
+                            info_.typeName(), size_ / kMiB, mode);
     Log::info(L"Allocated GPU drive: " + infoText_);
 }
 
@@ -281,10 +290,7 @@ uint32_t VulkanDrive::chooseStagingMemoryType(uint32_t allowedBits) {
 }
 
 void VulkanDrive::allocateStorage(uint64_t sizeBytes) {
-    wchar_t stagingFlag[16] = {};
-    const bool forceStaging =
-        GetEnvironmentVariableW(L"GPURAMDRIVE_FORCE_STAGING", stagingFlag,
-                                static_cast<DWORD>(std::size(stagingFlag))) > 0;
+    const bool forceStaging = environmentFlag(L"GPURAMDRIVE_FORCE_STAGING");
 
     uint64_t remaining = sizeBytes;
     uint64_t offset = 0;
@@ -408,6 +414,26 @@ void VulkanDrive::allocateStorage(uint64_t sizeBytes) {
             allocated = true;
         }
     }
+}
+
+void VulkanDrive::configureReadPath() {
+    if (!direct_) {
+        stagedReads_ = false;
+        return;
+    }
+
+    if (environmentFlag(L"GPURAMDRIVE_STAGED_READS")) {
+        stagedReads_ = true;
+    } else if (environmentFlag(L"GPURAMDRIVE_DIRECT_READS")) {
+        stagedReads_ = false;
+    } else {
+        stagedReads_ =
+            info_.type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    }
+
+    Log::debug(std::format(L"Direct-mapped reads: {}",
+                           stagedReads_ ? L"staged via copy engine"
+                                        : L"CPU memcpy from BAR"));
 }
 
 void VulkanDrive::allocateStagingBuffer() {
@@ -646,12 +672,13 @@ void VulkanDrive::read(uint64_t offset, void* destination, size_t length) {
         uint64_t available = 0;
         Segment& segment = locate(position, local, available);
 
+        const bool directRead = direct_ && !stagedReads_;
         uint64_t chunk = std::min<uint64_t>(length, available);
-        if (!direct_) {
+        if (!directRead) {
             chunk = std::min<uint64_t>(chunk, stagingSize_);
         }
 
-        if (direct_) {
+        if (directRead) {
             invalidateRange(segment, local, chunk);
             std::memcpy(out, static_cast<uint8_t*>(segment.mapped) + local,
                         static_cast<size_t>(chunk));
