@@ -6,7 +6,8 @@ that follow from it.
 
 ## Current status
 
-- `v0.9.1` is the last published release and still uses the old ImDisk proxy.
+- `v0.9.2` is the current pre-release and contains the WinSpd backend.
+  `v0.9.1` is the last stable release and still uses the old ImDisk proxy.
 - The WinSpd backend is implemented, but it has not been measured on real
   Windows hardware yet.
 - The old RX 7900 XTX baseline exposed pathological direct-mapped reads. The
@@ -175,6 +176,7 @@ ongoing driver maintenance. Do not start there until Gates A–C are measured.
 
 ## Breadcrumb log
 
+- 2026-10-22: published `v0.9.2` as a pre-release with the WinSpd backend.
 - 2026-10-21, `49a20d8`: replaced the ImDisk storage path with a WinSpd backend,
   concurrent Vulkan I/O contexts, MBR creation, and `diskpart`-based format and
   assignment. Builds cleanly with MinGW-w64; Wine smoke tests pass, but the
