@@ -175,7 +175,7 @@ ongoing driver maintenance. Do not start there until Gates A–C are measured.
 
 ## Breadcrumb log
 
-- 2026-10-21: replaced the ImDisk storage path with a WinSpd backend,
+- 2026-10-21, `49a20d8`: replaced the ImDisk storage path with a WinSpd backend,
   concurrent Vulkan I/O contexts, MBR creation, and `diskpart`-based format and
   assignment. Builds cleanly with MinGW-w64; Wine smoke tests pass, but the
   WinSpd mount path is untested on real elevated Windows.
