@@ -1,3 +1,8 @@
+# NOTE
+Current disk mount driver implementations create massive overhead.
+!Won't produce great performance equal to your GPU bandwidth!
+At best you can expect something between 5-15GB/s depending on your hardware.
+
 # GpuRamDriveVk
 
 GpuRamDriveVk is a Vulkan-backed RAM disk for Windows. It allocates a flat
