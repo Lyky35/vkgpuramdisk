@@ -10,8 +10,7 @@ add_library(grd_core STATIC
     src/core/util.cpp
     src/core/log.cpp
     src/core/config.cpp
-    src/core/imdisk_api.cpp
-    src/core/proxy_server.cpp
+    src/core/spd_storage.cpp
     src/core/image.cpp
     src/core/environment.cpp
     src/core/task.cpp
@@ -20,6 +19,7 @@ add_library(grd_core STATIC
     src/gpu/vulkan_api.cpp
     src/gpu/vulkan_runtime.cpp
     src/gpu/vulkan_drive.cpp
+    src/spd/winspd_api.cpp
 )
 
 target_include_directories(grd_core PUBLIC
@@ -70,7 +70,13 @@ target_link_options(gpuvramdrive PRIVATE
     -static -static-libgcc -static-libstdc++ -municode
 )
 
-add_executable(gpuvramdisk-bench tools/bench.cpp)
+add_executable(gpuvramdisk-bench
+    tools/bench.cpp
+    tools/legacy_proxy_server.cpp
+)
+target_include_directories(gpuvramdisk-bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools
+)
 target_compile_options(gpuvramdisk-bench PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(gpuvramdisk-bench PRIVATE grd_core)
 target_link_options(gpuvramdisk-bench PRIVATE

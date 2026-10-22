@@ -4,8 +4,9 @@
 
 namespace grd {
 
-// Wire format shared with ImDisk's shared-memory proxy. These definitions
-// mirror imdproxy.h from the ImDisk project (MIT licensed).
+// Legacy benchmark wire format shared with ImDisk's shared-memory proxy.
+// These definitions mirror imdproxy.h from the ImDisk project (MIT licensed).
+// The application no longer uses this protocol; WinSpd replaces it.
 constexpr uint64_t kProxyHeaderSize = 4096;
 constexpr uint64_t kProxyBufferSize = 4ull * 1024ull * 1024ull;
 

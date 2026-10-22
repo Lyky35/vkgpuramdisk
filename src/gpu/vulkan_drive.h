@@ -4,8 +4,10 @@
 
 #include <vulkan/vulkan.h>
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -55,15 +57,21 @@ private:
     VulkanDrive(VulkanApi& api, VkPhysicalDevice physicalDevice,
                 const GpuDeviceInfo& info);
 
+    struct IoContext;
+    class ContextLease;
+
     void initialize(uint64_t sizeBytes);
     void cleanup();
 
     void createLogicalDevice();
     void createCommandObjects();
     void allocateStorage(uint64_t sizeBytes);
-    void allocateStagingBuffer();
+    void allocateStagingBuffers();
     void configureReadPath();
     void zeroStorage();
+
+    IoContext& acquireContext();
+    void releaseContext(IoContext& context);
 
     uint32_t chooseMemoryType(uint32_t allowedBits, bool requireDeviceLocal);
     uint32_t chooseStagingMemoryType(uint32_t allowedBits);
@@ -71,18 +79,21 @@ private:
     Segment& locate(uint64_t offset, uint64_t& localOffset,
                     uint64_t& available);
 
-    void fillSegment(const Segment& segment);
-    void submitCopy(VkBuffer source, VkDeviceSize sourceOffset, VkBuffer dest,
+    void fillSegment(IoContext& context, const Segment& segment);
+    void submitCopy(IoContext& context, VkBuffer source,
+                    VkDeviceSize sourceOffset, VkBuffer dest,
                     VkDeviceSize destOffset, VkDeviceSize size,
                     bool transferToDevice);
-    void waitForFence();
+    void waitForFence(IoContext& context);
     void flushRange(const Segment& segment, uint64_t offset, uint64_t length);
     void invalidateRange(const Segment& segment, uint64_t offset,
                          uint64_t length);
-    void flushStaging(uint64_t offset, uint64_t length);
-    void invalidateStaging(uint64_t offset, uint64_t length);
-    void mappedMemoryBarrier(VkDeviceMemory memory, uint64_t offset,
-                             uint64_t length, bool flush);
+    void flushStaging(IoContext& context, uint64_t offset, uint64_t length);
+    void invalidateStaging(IoContext& context, uint64_t offset,
+                           uint64_t length);
+    void mappedMemoryBarrier(VkDeviceMemory memory, void* mapped,
+                             VkDeviceSize allocationSize, bool coherent,
+                             uint64_t offset, uint64_t length, bool flush);
 
     VulkanApi& api_;
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
@@ -91,9 +102,6 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t queueFamily_ = UINT32_MAX;
-    VkCommandPool commandPool_ = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
 
     VkPhysicalDeviceProperties properties_ = {};
     VkPhysicalDeviceMemoryProperties memoryProperties_ = {};
@@ -107,12 +115,12 @@ private:
 
     std::vector<Segment> segments_;
 
-    VkBuffer stagingBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory_ = VK_NULL_HANDLE;
-    VkDeviceSize stagingAllocationSize_ = 0;
+    std::vector<std::unique_ptr<IoContext>> contexts_;
+    std::mutex contextMutex_;
+    std::condition_variable contextAvailable_;
+    std::mutex queueMutex_;
+    std::mutex flushMutex_;
     VkDeviceSize stagingSize_ = 0;
-    void* stagingMapped_ = nullptr;
-    bool stagingCoherent_ = false;
 
     std::wstring infoText_;
 };

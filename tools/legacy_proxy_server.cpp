@@ -1,4 +1,4 @@
-#include "core/proxy_server.h"
+#include "legacy_proxy_server.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -8,7 +8,7 @@
 #include <utility>
 
 #include "core/log.h"
-#include "core/proxy_protocol.h"
+#include "legacy_proxy_protocol.h"
 #include "core/util.h"
 
 namespace grd {

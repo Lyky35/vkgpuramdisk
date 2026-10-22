@@ -721,6 +721,10 @@ std::optional<DriveConfig> MainWindow::readForm(std::wstring& error) const {
         error = L"A read-only drive cannot provide TEMP.";
         return std::nullopt;
     }
+    if (config.readOnly && config.imagePath.empty()) {
+        error = L"A read-only drive requires an image.";
+        return std::nullopt;
+    }
     return config;
 }
 
@@ -954,7 +958,10 @@ void MainWindow::onOpenConfig() {
 void MainWindow::onAbout() {
     MessageBoxW(hwnd_,
                 L"GpuRamDriveVk\n\nA Vulkan-backed RAM disk for Windows.\n"
-                L"Uses ImDisk as the volume driver.",
+                L"Uses WinSpd as the volume driver.\n\n"
+                L"WinSpd - Windows Storage Proxy Driver, "
+                L"Copyright (C) Bill Zissimopoulos\n"
+                L"https://github.com/winfsp/winspd",
                 L"About GpuRamDriveVk", MB_OK | MB_ICONINFORMATION);
 }
 

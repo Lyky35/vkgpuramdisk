@@ -5,8 +5,7 @@
 #include <string>
 
 #include "core/config.h"
-#include "core/imdisk_api.h"
-#include "core/proxy_server.h"
+#include "core/spd_storage.h"
 
 namespace grd {
 
@@ -20,7 +19,7 @@ struct DriveStatus {
     std::wstring backend;
 };
 
-// Owns one Vulkan allocation, its ImDisk proxy server, and the mounted volume.
+// Owns one Vulkan allocation, its WinSpd storage unit, and the mounted volume.
 class Drive {
 public:
     explicit Drive(DriveConfig config);
@@ -43,21 +42,12 @@ public:
                    std::wstring& error);
 
 private:
-    bool startProxy(std::wstring& error);
-    bool createDevice(bool readOnly, std::wstring& error);
-    bool removeDevice(bool force, std::wstring& error);
-    bool remountReadOnly(std::wstring& error);
-    bool formatVolume(FileSystem filesystem, const std::wstring& label,
-                      std::wstring& error);
     void resetStorage();
     std::wstring resolvedImagePath() const;
 
     DriveConfig config_;
     std::unique_ptr<VulkanDrive> gpu_;
-    DWORD deviceNumber_ = 0;
-    bool deviceAttached_ = false;
-    ProxyServer proxy_;
-    ImDiskApi imdisk_;
+    std::unique_ptr<SpdStorage> storage_;
     bool mounted_ = false;
     bool ownsTemp_ = false;
     uint64_t sizeBytes_ = 0;

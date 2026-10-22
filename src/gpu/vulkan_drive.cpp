@@ -4,6 +4,7 @@
 #include <cstring>
 #include <format>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 
 #include "core/log.h"
@@ -52,7 +53,50 @@ bool environmentFlag(const wchar_t* name) {
                                    static_cast<DWORD>(std::size(value))) > 0;
 }
 
+uint32_t environmentContextCount() {
+    wchar_t value[16] = {};
+    const DWORD length = GetEnvironmentVariableW(
+        L"GPURAMDRIVE_IO_CONTEXTS", value,
+        static_cast<DWORD>(std::size(value)));
+    if (length == 0 || length >= std::size(value)) {
+        return 8;
+    }
+    const auto parsed = parseUInt64(value);
+    if (!parsed || *parsed == 0) {
+        return 8;
+    }
+    return static_cast<uint32_t>(std::min<uint64_t>(*parsed, 32));
+}
+
 }  // namespace
+
+struct VulkanDrive::IoContext {
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VkDeviceSize stagingAllocationSize = 0;
+    void* stagingMapped = nullptr;
+    bool stagingCoherent = false;
+    bool busy = false;
+};
+
+class VulkanDrive::ContextLease {
+public:
+    explicit ContextLease(VulkanDrive& drive)
+        : drive_(drive), context_(&drive.acquireContext()) {}
+    ~ContextLease() { drive_.releaseContext(*context_); }
+
+    ContextLease(const ContextLease&) = delete;
+    ContextLease& operator=(const ContextLease&) = delete;
+
+    IoContext& get() const { return *context_; }
+
+private:
+    VulkanDrive& drive_;
+    IoContext* context_;
+};
 
 std::unique_ptr<VulkanDrive> VulkanDrive::create(VulkanApi& api,
                                                  VkPhysicalDevice physicalDevice,
@@ -91,7 +135,7 @@ void VulkanDrive::initialize(uint64_t sizeBytes) {
         throw std::runtime_error("The requested drive size is too large.");
     }
 
-    // Sector-sized alignment keeps every ImDisk transfer and every image copy
+    // Sector-sized alignment keeps every storage transfer and every image copy
     // on a clean boundary.
     size_ = (sizeBytes + 4095) & ~uint64_t{4095};
 
@@ -109,7 +153,7 @@ void VulkanDrive::initialize(uint64_t sizeBytes) {
     configureReadPath();
 
     if (!direct_ || stagedReads_) {
-        allocateStagingBuffer();
+        allocateStagingBuffers();
     }
 
     zeroStorage();
@@ -180,37 +224,77 @@ void VulkanDrive::createCommandObjects() {
         throw std::runtime_error("No transfer queue family was selected.");
     }
 
-    const VkCommandPoolCreateInfo poolInfo = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-        .queueFamilyIndex = queueFamily_,
-    };
+    const uint32_t count = environmentContextCount();
+    contexts_.reserve(count);
+    for (uint32_t index = 0; index < count; ++index) {
+        auto context = std::make_unique<IoContext>();
 
-    VkResult result =
-        api_.CreateCommandPool(device_, &poolInfo, nullptr, &commandPool_);
-    if (result != VK_SUCCESS) {
-        throw vulkanFailure("vkCreateCommandPool", result);
+        const VkCommandPoolCreateInfo poolInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queueFamilyIndex = queueFamily_,
+        };
+
+        VkResult result = api_.CreateCommandPool(device_, &poolInfo, nullptr,
+                                                 &context->commandPool);
+        if (result != VK_SUCCESS) {
+            throw vulkanFailure("vkCreateCommandPool", result);
+        }
+
+        const VkCommandBufferAllocateInfo bufferInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = context->commandPool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        result = api_.AllocateCommandBuffers(device_, &bufferInfo,
+                                             &context->commandBuffer);
+        if (result != VK_SUCCESS) {
+            throw vulkanFailure("vkAllocateCommandBuffers", result);
+        }
+
+        const VkFenceCreateInfo fenceInfo = {
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .flags = 0,
+        };
+        result = api_.CreateFence(device_, &fenceInfo, nullptr, &context->fence);
+        if (result != VK_SUCCESS) {
+            throw vulkanFailure("vkCreateFence", result);
+        }
+
+        contexts_.push_back(std::move(context));
     }
 
-    const VkCommandBufferAllocateInfo bufferInfo = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = commandPool_,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1,
-    };
-    result = api_.AllocateCommandBuffers(device_, &bufferInfo, &commandBuffer_);
-    if (result != VK_SUCCESS) {
-        throw vulkanFailure("vkAllocateCommandBuffers", result);
+    Log::debug(std::format(L"Created {} concurrent GPU I/O contexts.", count));
+}
+
+VulkanDrive::IoContext& VulkanDrive::acquireContext() {
+    std::unique_lock lock(contextMutex_);
+    contextAvailable_.wait(lock, [this] {
+        for (const auto& context : contexts_) {
+            if (!context->busy) {
+                return true;
+            }
+        }
+        return false;
+    });
+
+    for (const auto& context : contexts_) {
+        if (!context->busy) {
+            context->busy = true;
+            return *context;
+        }
     }
 
-    const VkFenceCreateInfo fenceInfo = {
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .flags = 0,
-    };
-    result = api_.CreateFence(device_, &fenceInfo, nullptr, &fence_);
-    if (result != VK_SUCCESS) {
-        throw vulkanFailure("vkCreateFence", result);
+    throw std::runtime_error("No GPU I/O context is available.");
+}
+
+void VulkanDrive::releaseContext(IoContext& context) {
+    {
+        std::lock_guard lock(contextMutex_);
+        context.busy = false;
     }
+    contextAvailable_.notify_one();
 }
 
 uint32_t VulkanDrive::chooseMemoryType(uint32_t allowedBits,
@@ -436,101 +520,112 @@ void VulkanDrive::configureReadPath() {
                                         : L"CPU memcpy from BAR"));
 }
 
-void VulkanDrive::allocateStagingBuffer() {
+void VulkanDrive::allocateStagingBuffers() {
     stagingSize_ = std::min(size_, kStagingSize);
     if (stagingSize_ == 0) {
         stagingSize_ = 4096;
     }
 
-    const VkBufferCreateInfo bufferInfo = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = stagingSize_,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .queueFamilyIndexCount = 0,
-        .pQueueFamilyIndices = nullptr,
-    };
+    for (const auto& context : contexts_) {
+        const VkBufferCreateInfo bufferInfo = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = stagingSize_,
+            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        };
 
-    VkResult result =
-        api_.CreateBuffer(device_, &bufferInfo, nullptr, &stagingBuffer_);
-    if (result != VK_SUCCESS) {
-        throw vulkanFailure("vkCreateBuffer (staging)", result);
+        VkResult result = api_.CreateBuffer(device_, &bufferInfo, nullptr,
+                                            &context->stagingBuffer);
+        if (result != VK_SUCCESS) {
+            throw vulkanFailure("vkCreateBuffer (staging)", result);
+        }
+
+        VkMemoryRequirements requirements = {};
+        api_.GetBufferMemoryRequirements(device_, context->stagingBuffer,
+                                          &requirements);
+
+        const uint32_t type =
+            chooseStagingMemoryType(requirements.memoryTypeBits);
+        if (type == UINT32_MAX) {
+            throw std::runtime_error(
+                "The Vulkan device has no host-visible memory for a staging "
+                "buffer.");
+        }
+
+        const VkMemoryAllocateInfo allocateInfo = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = requirements.size,
+            .memoryTypeIndex = type,
+        };
+        result = api_.AllocateMemory(device_, &allocateInfo, nullptr,
+                                     &context->stagingMemory);
+        if (result != VK_SUCCESS) {
+            throw vulkanFailure("vkAllocateMemory (staging)", result);
+        }
+
+        result = api_.BindBufferMemory(device_, context->stagingBuffer,
+                                       context->stagingMemory, 0);
+        if (result != VK_SUCCESS) {
+            throw vulkanFailure("vkBindBufferMemory (staging)", result);
+        }
+
+        result = api_.MapMemory(device_, context->stagingMemory, 0,
+                                VK_WHOLE_SIZE, 0, &context->stagingMapped);
+        if (result != VK_SUCCESS) {
+            throw vulkanFailure("vkMapMemory (staging)", result);
+        }
+
+        context->stagingAllocationSize = requirements.size;
+        context->stagingCoherent =
+            (memoryProperties_.memoryTypes[type].propertyFlags &
+             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
     }
-
-    VkMemoryRequirements requirements = {};
-    api_.GetBufferMemoryRequirements(device_, stagingBuffer_, &requirements);
-
-    const uint32_t type = chooseStagingMemoryType(requirements.memoryTypeBits);
-    if (type == UINT32_MAX) {
-        throw std::runtime_error(
-            "The Vulkan device has no host-visible memory for a staging buffer.");
-    }
-
-    const VkMemoryAllocateInfo allocateInfo = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = requirements.size,
-        .memoryTypeIndex = type,
-    };
-    result = api_.AllocateMemory(device_, &allocateInfo, nullptr, &stagingMemory_);
-    if (result != VK_SUCCESS) {
-        throw vulkanFailure("vkAllocateMemory (staging)", result);
-    }
-
-    result = api_.BindBufferMemory(device_, stagingBuffer_, stagingMemory_, 0);
-    if (result != VK_SUCCESS) {
-        throw vulkanFailure("vkBindBufferMemory (staging)", result);
-    }
-
-    result = api_.MapMemory(device_, stagingMemory_, 0, VK_WHOLE_SIZE, 0,
-                            &stagingMapped_);
-    if (result != VK_SUCCESS) {
-        throw vulkanFailure("vkMapMemory (staging)", result);
-    }
-
-    stagingAllocationSize_ = requirements.size;
-    stagingCoherent_ =
-        (memoryProperties_.memoryTypes[type].propertyFlags &
-         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 }
 
 void VulkanDrive::zeroStorage() {
     if (direct_) {
         for (const Segment& segment : segments_) {
-            std::memset(segment.mapped, 0, static_cast<size_t>(segment.logicalSize));
+            std::memset(segment.mapped, 0,
+                        static_cast<size_t>(segment.logicalSize));
             flushRange(segment, 0, segment.logicalSize);
         }
         return;
     }
 
+    ContextLease lease(*this);
     for (const Segment& segment : segments_) {
-        fillSegment(segment);
+        fillSegment(lease.get(), segment);
     }
 }
 
-void VulkanDrive::fillSegment(const Segment& segment) {
+void VulkanDrive::fillSegment(IoContext& context, const Segment& segment) {
     const VkCommandBufferBeginInfo beginInfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
 
-    VkResult result = api_.BeginCommandBuffer(commandBuffer_, &beginInfo);
+    VkResult result = api_.BeginCommandBuffer(context.commandBuffer, &beginInfo);
     if (result != VK_SUCCESS) {
         throw vulkanFailure("vkBeginCommandBuffer", result);
     }
 
-    api_.CmdFillBuffer(commandBuffer_, segment.buffer, 0, VK_WHOLE_SIZE, 0);
+    api_.CmdFillBuffer(context.commandBuffer, segment.buffer, 0, VK_WHOLE_SIZE,
+                       0);
 
     VkMemoryBarrier barrier = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT |
+                         VK_ACCESS_TRANSFER_WRITE_BIT,
     };
-    api_.CmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    api_.CmdPipelineBarrier(context.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
                             nullptr, 0, nullptr);
 
-    result = api_.EndCommandBuffer(commandBuffer_);
+    result = api_.EndCommandBuffer(context.commandBuffer);
     if (result != VK_SUCCESS) {
         throw vulkanFailure("vkEndCommandBuffer", result);
     }
@@ -541,22 +636,26 @@ void VulkanDrive::fillSegment(const Segment& segment) {
         .pWaitSemaphores = nullptr,
         .pWaitDstStageMask = nullptr,
         .commandBufferCount = 1,
-        .pCommandBuffers = &commandBuffer_,
+        .pCommandBuffers = &context.commandBuffer,
         .signalSemaphoreCount = 0,
         .pSignalSemaphores = nullptr,
     };
 
-    api_.ResetFences(device_, 1, &fence_);
-    result = api_.QueueSubmit(queue_, 1, &submitInfo, fence_);
+    {
+        std::lock_guard lock(queueMutex_);
+        api_.ResetFences(device_, 1, &context.fence);
+        result = api_.QueueSubmit(queue_, 1, &submitInfo, context.fence);
+    }
     if (result != VK_SUCCESS) {
         throw vulkanFailure("vkQueueSubmit (zero fill)", result);
     }
-    waitForFence();
+    waitForFence(context);
 }
 
-void VulkanDrive::submitCopy(VkBuffer source, VkDeviceSize sourceOffset,
-                             VkBuffer dest, VkDeviceSize destOffset,
-                             VkDeviceSize size, bool transferToDevice) {
+void VulkanDrive::submitCopy(IoContext& context, VkBuffer source,
+                             VkDeviceSize sourceOffset, VkBuffer dest,
+                             VkDeviceSize destOffset, VkDeviceSize size,
+                             bool transferToDevice) {
     (void)transferToDevice;
 
     const VkCommandBufferBeginInfo beginInfo = {
@@ -564,7 +663,7 @@ void VulkanDrive::submitCopy(VkBuffer source, VkDeviceSize sourceOffset,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
 
-    VkResult result = api_.BeginCommandBuffer(commandBuffer_, &beginInfo);
+    VkResult result = api_.BeginCommandBuffer(context.commandBuffer, &beginInfo);
     if (result != VK_SUCCESS) {
         throw vulkanFailure("vkBeginCommandBuffer", result);
     }
@@ -574,7 +673,7 @@ void VulkanDrive::submitCopy(VkBuffer source, VkDeviceSize sourceOffset,
         .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
     };
-    api_.CmdPipelineBarrier(commandBuffer_,
+    api_.CmdPipelineBarrier(context.commandBuffer,
                             VK_PIPELINE_STAGE_HOST_BIT |
                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
@@ -585,15 +684,15 @@ void VulkanDrive::submitCopy(VkBuffer source, VkDeviceSize sourceOffset,
         .dstOffset = destOffset,
         .size = size,
     };
-    api_.CmdCopyBuffer(commandBuffer_, source, dest, 1, &region);
+    api_.CmdCopyBuffer(context.commandBuffer, source, dest, 1, &region);
 
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    api_.CmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    api_.CmdPipelineBarrier(context.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                             VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0,
                             nullptr, 0, nullptr);
 
-    result = api_.EndCommandBuffer(commandBuffer_);
+    result = api_.EndCommandBuffer(context.commandBuffer);
     if (result != VK_SUCCESS) {
         throw vulkanFailure("vkEndCommandBuffer", result);
     }
@@ -604,22 +703,25 @@ void VulkanDrive::submitCopy(VkBuffer source, VkDeviceSize sourceOffset,
         .pWaitSemaphores = nullptr,
         .pWaitDstStageMask = nullptr,
         .commandBufferCount = 1,
-        .pCommandBuffers = &commandBuffer_,
+        .pCommandBuffers = &context.commandBuffer,
         .signalSemaphoreCount = 0,
         .pSignalSemaphores = nullptr,
     };
 
-    api_.ResetFences(device_, 1, &fence_);
-    result = api_.QueueSubmit(queue_, 1, &submitInfo, fence_);
+    {
+        std::lock_guard lock(queueMutex_);
+        api_.ResetFences(device_, 1, &context.fence);
+        result = api_.QueueSubmit(queue_, 1, &submitInfo, context.fence);
+    }
     if (result != VK_SUCCESS) {
         throw vulkanFailure("vkQueueSubmit", result);
     }
-    waitForFence();
+    waitForFence(context);
 }
 
-void VulkanDrive::waitForFence() {
+void VulkanDrive::waitForFence(IoContext& context) {
     const VkResult result =
-        api_.WaitForFences(device_, 1, &fence_, VK_TRUE, kFenceTimeout);
+        api_.WaitForFences(device_, 1, &context.fence, VK_TRUE, kFenceTimeout);
     if (result == VK_TIMEOUT) {
         throw std::runtime_error(
             "GPU transfer timed out. The display driver may have reset the GPU.");
@@ -627,7 +729,7 @@ void VulkanDrive::waitForFence() {
     if (result != VK_SUCCESS) {
         throw vulkanFailure("vkWaitForFences", result);
     }
-    api_.ResetFences(device_, 1, &fence_);
+    api_.ResetFences(device_, 1, &context.fence);
 }
 
 VulkanDrive::Segment& VulkanDrive::locate(uint64_t offset, uint64_t& localOffset,
@@ -664,6 +766,14 @@ void VulkanDrive::read(uint64_t offset, void* destination, size_t length) {
         throw std::out_of_range("GPU drive read is out of range.");
     }
 
+    const bool directRead = direct_ && !stagedReads_;
+    std::unique_ptr<ContextLease> lease;
+    IoContext* context = nullptr;
+    if (!directRead) {
+        lease = std::make_unique<ContextLease>(*this);
+        context = &lease->get();
+    }
+
     auto* out = static_cast<uint8_t*>(destination);
     uint64_t position = offset;
 
@@ -672,7 +782,6 @@ void VulkanDrive::read(uint64_t offset, void* destination, size_t length) {
         uint64_t available = 0;
         Segment& segment = locate(position, local, available);
 
-        const bool directRead = direct_ && !stagedReads_;
         uint64_t chunk = std::min<uint64_t>(length, available);
         if (!directRead) {
             chunk = std::min<uint64_t>(chunk, stagingSize_);
@@ -683,9 +792,11 @@ void VulkanDrive::read(uint64_t offset, void* destination, size_t length) {
             std::memcpy(out, static_cast<uint8_t*>(segment.mapped) + local,
                         static_cast<size_t>(chunk));
         } else {
-            submitCopy(segment.buffer, local, stagingBuffer_, 0, chunk, false);
-            invalidateStaging(0, chunk);
-            std::memcpy(out, stagingMapped_, static_cast<size_t>(chunk));
+            submitCopy(*context, segment.buffer, local, context->stagingBuffer,
+                       0, chunk, false);
+            invalidateStaging(*context, 0, chunk);
+            std::memcpy(out, context->stagingMapped,
+                        static_cast<size_t>(chunk));
         }
 
         out += chunk;
@@ -700,6 +811,13 @@ void VulkanDrive::write(uint64_t offset, const void* source, size_t length) {
     }
     if (offset > size_ || length > size_ - offset) {
         throw std::out_of_range("GPU drive write is out of range.");
+    }
+
+    std::unique_ptr<ContextLease> lease;
+    IoContext* context = nullptr;
+    if (!direct_) {
+        lease = std::make_unique<ContextLease>(*this);
+        context = &lease->get();
     }
 
     const auto* in = static_cast<const uint8_t*>(source);
@@ -720,9 +838,11 @@ void VulkanDrive::write(uint64_t offset, const void* source, size_t length) {
                         static_cast<size_t>(chunk));
             flushRange(segment, local, chunk);
         } else {
-            std::memcpy(stagingMapped_, in, static_cast<size_t>(chunk));
-            flushStaging(0, chunk);
-            submitCopy(stagingBuffer_, 0, segment.buffer, local, chunk, true);
+            std::memcpy(context->stagingMapped, in,
+                        static_cast<size_t>(chunk));
+            flushStaging(*context, 0, chunk);
+            submitCopy(*context, context->stagingBuffer, 0, segment.buffer,
+                       local, chunk, true);
         }
 
         in += chunk;
@@ -731,28 +851,11 @@ void VulkanDrive::write(uint64_t offset, const void* source, size_t length) {
     }
 }
 
-void VulkanDrive::mappedMemoryBarrier(VkDeviceMemory memory, uint64_t offset,
+void VulkanDrive::mappedMemoryBarrier(VkDeviceMemory memory, void* mapped,
+                                      VkDeviceSize allocationSize,
+                                      bool coherent, uint64_t offset,
                                       uint64_t length, bool flush) {
-    void* mapped = nullptr;
-    VkDeviceSize allocationSize = 0;
-    bool coherent = true;
-
-    if (memory == stagingMemory_) {
-        mapped = stagingMapped_;
-        allocationSize = stagingAllocationSize_;
-        coherent = stagingCoherent_;
-    } else {
-        for (const Segment& segment : segments_) {
-            if (segment.memory == memory) {
-                mapped = segment.mapped;
-                allocationSize = segment.allocationSize;
-                coherent = segment.coherent;
-                break;
-            }
-        }
-    }
-
-    if (mapped == nullptr || coherent) {
+    if (mapped == nullptr || coherent || length == 0) {
         return;
     }
 
@@ -762,15 +865,12 @@ void VulkanDrive::mappedMemoryBarrier(VkDeviceMemory memory, uint64_t offset,
     }
 
     const uint64_t start = offset & ~(static_cast<uint64_t>(atom) - 1);
-    uint64_t end = (offset + length + atom - 1) & ~(static_cast<uint64_t>(atom) - 1);
+    uint64_t end =
+        (offset + length + atom - 1) & ~(static_cast<uint64_t>(atom) - 1);
     if (end > allocationSize) {
         end = allocationSize;
     }
     if (end <= start) {
-        return;
-    }
-
-    if (length == 0) {
         return;
     }
 
@@ -781,9 +881,12 @@ void VulkanDrive::mappedMemoryBarrier(VkDeviceMemory memory, uint64_t offset,
         .size = end - start,
     };
 
-    const VkResult result =
-        flush ? api_.FlushMappedMemoryRanges(device_, 1, &range)
-              : api_.InvalidateMappedMemoryRanges(device_, 1, &range);
+    VkResult result = VK_SUCCESS;
+    {
+        std::lock_guard lock(flushMutex_);
+        result = flush ? api_.FlushMappedMemoryRanges(device_, 1, &range)
+                       : api_.InvalidateMappedMemoryRanges(device_, 1, &range);
+    }
     if (result != VK_SUCCESS) {
         throw vulkanFailure(flush ? "vkFlushMappedMemoryRanges"
                                   : "vkInvalidateMappedMemoryRanges",
@@ -793,20 +896,28 @@ void VulkanDrive::mappedMemoryBarrier(VkDeviceMemory memory, uint64_t offset,
 
 void VulkanDrive::flushRange(const Segment& segment, uint64_t offset,
                              uint64_t length) {
-    mappedMemoryBarrier(segment.memory, offset, length, true);
+    mappedMemoryBarrier(segment.memory, segment.mapped, segment.allocationSize,
+                        segment.coherent, offset, length, true);
 }
 
 void VulkanDrive::invalidateRange(const Segment& segment, uint64_t offset,
                                   uint64_t length) {
-    mappedMemoryBarrier(segment.memory, offset, length, false);
+    mappedMemoryBarrier(segment.memory, segment.mapped, segment.allocationSize,
+                        segment.coherent, offset, length, false);
 }
 
-void VulkanDrive::flushStaging(uint64_t offset, uint64_t length) {
-    mappedMemoryBarrier(stagingMemory_, offset, length, true);
+void VulkanDrive::flushStaging(IoContext& context, uint64_t offset,
+                               uint64_t length) {
+    mappedMemoryBarrier(context.stagingMemory, context.stagingMapped,
+                        context.stagingAllocationSize, context.stagingCoherent,
+                        offset, length, true);
 }
 
-void VulkanDrive::invalidateStaging(uint64_t offset, uint64_t length) {
-    mappedMemoryBarrier(stagingMemory_, offset, length, false);
+void VulkanDrive::invalidateStaging(IoContext& context, uint64_t offset,
+                                    uint64_t length) {
+    mappedMemoryBarrier(context.stagingMemory, context.stagingMapped,
+                        context.stagingAllocationSize, context.stagingCoherent,
+                        offset, length, false);
 }
 
 void VulkanDrive::cleanup() {
@@ -814,18 +925,34 @@ void VulkanDrive::cleanup() {
         api_.DeviceWaitIdle(device_);
     }
 
-    if (stagingMapped_ != nullptr && api_.UnmapMemory != nullptr) {
-        api_.UnmapMemory(device_, stagingMemory_);
-        stagingMapped_ = nullptr;
+    for (const auto& context : contexts_) {
+        if (context->stagingMapped != nullptr &&
+            api_.UnmapMemory != nullptr) {
+            api_.UnmapMemory(device_, context->stagingMemory);
+            context->stagingMapped = nullptr;
+        }
+        if (context->stagingBuffer != VK_NULL_HANDLE &&
+            api_.DestroyBuffer != nullptr) {
+            api_.DestroyBuffer(device_, context->stagingBuffer, nullptr);
+            context->stagingBuffer = VK_NULL_HANDLE;
+        }
+        if (context->stagingMemory != VK_NULL_HANDLE &&
+            api_.FreeMemory != nullptr) {
+            api_.FreeMemory(device_, context->stagingMemory, nullptr);
+            context->stagingMemory = VK_NULL_HANDLE;
+        }
+        if (context->fence != VK_NULL_HANDLE &&
+            api_.DestroyFence != nullptr) {
+            api_.DestroyFence(device_, context->fence, nullptr);
+            context->fence = VK_NULL_HANDLE;
+        }
+        if (context->commandPool != VK_NULL_HANDLE &&
+            api_.DestroyCommandPool != nullptr) {
+            api_.DestroyCommandPool(device_, context->commandPool, nullptr);
+            context->commandPool = VK_NULL_HANDLE;
+        }
     }
-    if (stagingBuffer_ != VK_NULL_HANDLE && api_.DestroyBuffer != nullptr) {
-        api_.DestroyBuffer(device_, stagingBuffer_, nullptr);
-        stagingBuffer_ = VK_NULL_HANDLE;
-    }
-    if (stagingMemory_ != VK_NULL_HANDLE && api_.FreeMemory != nullptr) {
-        api_.FreeMemory(device_, stagingMemory_, nullptr);
-        stagingMemory_ = VK_NULL_HANDLE;
-    }
+    contexts_.clear();
 
     for (Segment& segment : segments_) {
         if (segment.mapped != nullptr && api_.UnmapMemory != nullptr) {
@@ -843,14 +970,6 @@ void VulkanDrive::cleanup() {
     }
     segments_.clear();
 
-    if (fence_ != VK_NULL_HANDLE && api_.DestroyFence != nullptr) {
-        api_.DestroyFence(device_, fence_, nullptr);
-        fence_ = VK_NULL_HANDLE;
-    }
-    if (commandPool_ != VK_NULL_HANDLE && api_.DestroyCommandPool != nullptr) {
-        api_.DestroyCommandPool(device_, commandPool_, nullptr);
-        commandPool_ = VK_NULL_HANDLE;
-    }
     if (device_ != VK_NULL_HANDLE && api_.DestroyDevice != nullptr) {
         api_.DestroyDevice(device_, nullptr);
         device_ = VK_NULL_HANDLE;

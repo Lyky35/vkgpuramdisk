@@ -43,7 +43,7 @@ int runGui(HINSTANCE instance) {
 
     if (!grd::isElevated()) {
         MessageBoxW(nullptr,
-                    L"GpuRamDriveVk must run as administrator. ImDisk and GPU "
+                    L"GpuRamDriveVk must run as administrator. WinSpd and GPU "
                     L"drives require elevated access.",
                     L"GpuRamDriveVk", MB_OK | MB_ICONERROR);
         return 1;

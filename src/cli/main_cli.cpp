@@ -45,11 +45,15 @@ const wchar_t* kUsage =
     L"  --fs <fs>          NTFS, exFAT, or FAT32 (default NTFS)\n"
     L"  --label <text>     Volume label (default GpuDisk)\n"
     L"  --image <path>     Raw image to load on mount and save on unmount\n"
-    L"  --type <hd|fd>     Hard disk or floppy device type\n"
-    L"  --removable        Mark the device as removable\n"
-    L"  --read-only        Mount read-only (requires an image or a blank format)\n"
+    L"  --type <hd|fd>     Device type metadata (WinSpd presents a fixed disk)\n"
+    L"  --removable        Removable metadata (WinSpd presents a fixed disk)\n"
+    L"  --read-only        Mount read-only (requires an existing image)\n"
     L"  --temp             Point TEMP and TMP at <letter>:\\Temp\n"
-    L"  --autostart        Mount this drive at logon\n";
+    L"  --autostart        Mount this drive at logon\n"
+    L"\n"
+    L"Storage driver: WinSpd - Windows Storage Proxy Driver, "
+    L"Copyright (C) Bill Zissimopoulos\n"
+    L"https://github.com/winfsp/winspd\n";
 
 HANDLE g_interruptEvent = nullptr;
 
@@ -370,6 +374,10 @@ int addDrive(const std::wstring& letterText,
 
     if (config.readOnly && config.useTempFolder) {
         printError(L"A read-only drive cannot provide TEMP.");
+        return 2;
+    }
+    if (config.readOnly && config.imagePath.empty()) {
+        printError(L"A read-only drive requires an image.");
         return 2;
     }
 

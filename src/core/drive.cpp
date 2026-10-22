@@ -2,11 +2,9 @@
 
 #include <windows.h>
 
-#include <algorithm>
 #include <cwctype>
 #include <format>
 #include <utility>
-#include <vector>
 
 #include "core/environment.h"
 #include "core/image.h"
@@ -30,79 +28,6 @@ bool isAbsolutePath(const std::wstring& path) {
     return !path.empty() && (path[0] == L'\\' || path[0] == L'/');
 }
 
-std::wstring serviceName(wchar_t letter) {
-    return L"GpuRamDriveVk_" + std::wstring(1, letter);
-}
-
-bool runFormat(wchar_t letter, FileSystem filesystem, const std::wstring& label,
-               std::wstring& error) {
-    const wchar_t* fileSystem = filesystem == FileSystem::Fat32
-                                    ? L"FAT32"
-                                    : (filesystem == FileSystem::ExFat ? L"exFAT"
-                                                                      : L"NTFS");
-    const std::wstring executable = joinPath(systemDirectory(), L"format.com");
-    std::wstring command = quoteArgument(executable) + L" " +
-                           displayLetter(letter) + L" /FS:" + fileSystem +
-                           L" /Q /Y";
-    if (!label.empty()) {
-        command += L" /V:" + quoteArgument(label);
-    }
-
-    std::vector<wchar_t> commandLine(command.begin(), command.end());
-    commandLine.push_back(L'\0');
-
-    STARTUPINFOW startup = {};
-    startup.cb = sizeof(startup);
-    PROCESS_INFORMATION processInfo = {};
-    if (CreateProcessW(executable.c_str(), commandLine.data(), nullptr, nullptr,
-                       FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
-                       &processInfo) == FALSE) {
-        error = L"Unable to start format.com: " + lastError();
-        return false;
-    }
-
-    UniqueHandle process(processInfo.hProcess);
-    UniqueHandle thread(processInfo.hThread);
-
-    const DWORD wait = WaitForSingleObject(process.get(), 5 * 60 * 1000);
-    if (wait == WAIT_TIMEOUT) {
-        TerminateProcess(process.get(), 1);
-        WaitForSingleObject(process.get(), 5000);
-        error = L"format.com timed out.";
-        return false;
-    }
-    if (wait != WAIT_OBJECT_0) {
-        error = L"Unable to wait for format.com: " + lastError();
-        return false;
-    }
-
-    DWORD exitCode = 0;
-    if (GetExitCodeProcess(process.get(), &exitCode) == FALSE) {
-        error = L"Unable to read format.com's exit code: " + lastError();
-        return false;
-    }
-    if (exitCode != 0) {
-        error = std::format(L"format.com failed with exit code {}.", exitCode);
-        return false;
-    }
-
-    if (!label.empty()) {
-        const std::wstring root = driveRoot(letter);
-        bool labeled = false;
-        for (int attempt = 0; attempt < 3 && !labeled; ++attempt) {
-            labeled = SetVolumeLabelW(root.c_str(), label.c_str()) != FALSE;
-            if (!labeled) {
-                Sleep(200);
-            }
-        }
-        if (!labeled) {
-            Log::warn(L"Unable to set the volume label after formatting: " +
-                      lastError());
-        }
-    }
-    return true;
-}
-
 }  // namespace
 
 Drive::Drive(DriveConfig config) : config_(std::move(config)) {
@@ -113,11 +38,11 @@ Drive::Drive(DriveConfig config) : config_(std::move(config)) {
 Drive::~Drive() {
     std::wstring ignored;
     if (!unmount(true, ignored)) {
-        // The driver still owns the shared-memory volume. Keep the GPU block
-        // alive rather than freeing memory that ImDisk may still access.
-        Log::error(L"Leaking GPU storage because the ImDisk device could not "
-                   L"be removed: " + ignored);
-        proxy_.stop();
+        Log::error(L"Leaking GPU storage because the WinSpd unit could not be "
+                   L"stopped: " + ignored);
+        if (storage_) {
+            storage_.release();
+        }
         if (gpu_) {
             gpu_.release();
         }
@@ -132,99 +57,6 @@ std::wstring Drive::resolvedImagePath() const {
         return config_.imagePath;
     }
     return joinPath(executableDir(), config_.imagePath);
-}
-
-bool Drive::startProxy(std::wstring& error) {
-    if (!gpu_) {
-        error = L"GPU storage is not allocated.";
-        return false;
-    }
-
-    const std::wstring name = serviceName(config_.letter);
-    return proxy_.start(
-        name, sizeBytes_,
-        [this](uint64_t offset, void* buffer, size_t length) {
-            gpu_->read(offset, buffer, length);
-            return true;
-        },
-        [this](uint64_t offset, const void* buffer, size_t length) {
-            gpu_->write(offset, buffer, length);
-            return true;
-        },
-        error);
-}
-
-bool Drive::createDevice(bool readOnly, std::wstring& error) {
-    DWORD deviceNumber = 0;
-    if (!imdisk_.createProxyDevice(
-            serviceName(config_.letter), config_.letter,
-            config_.kind == DriveKind::Floppy, config_.removable, readOnly,
-            deviceNumber, error)) {
-        return false;
-    }
-    deviceNumber_ = deviceNumber;
-    deviceAttached_ = true;
-    return true;
-}
-
-bool Drive::formatVolume(FileSystem filesystem, const std::wstring& label,
-                         std::wstring& error) {
-    if (filesystem == FileSystem::Fat32 && sizeBytes_ > 32ull * 1024ull * kMiB) {
-        error = L"Windows cannot format a FAT32 volume larger than 32 GiB. "
-                L"Choose exFAT or NTFS.";
-        return false;
-    }
-    return runFormat(config_.letter, filesystem, label, error);
-}
-
-bool Drive::removeDevice(bool force, std::wstring& error) {
-    if (!deviceAttached_) {
-        return true;
-    }
-
-    std::wstring firstError;
-    if (imdisk_.removeByLetter(config_.letter, force, firstError)) {
-        deviceAttached_ = false;
-        deviceNumber_ = 0;
-        return true;
-    }
-
-    if (force && deviceNumber_ != 0) {
-        std::wstring byNumberError;
-        if (imdisk_.forceRemove(deviceNumber_, byNumberError)) {
-            deviceAttached_ = false;
-            deviceNumber_ = 0;
-            return true;
-        }
-        firstError += L" " + byNumberError;
-    }
-
-    error = firstError;
-    return false;
-}
-
-bool Drive::remountReadOnly(std::wstring& error) {
-    if (!removeDevice(true, error)) {
-        return false;
-    }
-
-    proxy_.stop();
-    for (int attempt = 0; attempt < 20; ++attempt) {
-        if (!isDriveLetterInUse(config_.letter)) {
-            break;
-        }
-        Sleep(100);
-    }
-    Sleep(200);
-
-    if (!startProxy(error)) {
-        return false;
-    }
-    if (!createDevice(true, error)) {
-        proxy_.stop();
-        return false;
-    }
-    return true;
 }
 
 bool Drive::mount(std::wstring& error) {
@@ -255,15 +87,24 @@ bool Drive::mount(std::wstring& error) {
                             displayLetter(config_.letter));
         return false;
     }
-    if (!ImDiskApi::isAvailable()) {
-        error = L"imdisk.cpl is not installed. Install the ImDisk Virtual "
-                L"Disk Driver first.";
+    if (!SpdStorage::isAvailable()) {
+        error = L"WinSpd is not installed. Install WinSpd 1.0B1 from "
+                L"https://github.com/winfsp/winspd/releases/tag/v1.0B1 and run "
+                L"GpuRamDriveVk as administrator.";
         return false;
     }
 
+    if (config_.kind != DriveKind::HardDisk || config_.removable) {
+        Log::warn(L"WinSpd presents a fixed SCSI disk; the configured floppy "
+                  L"type or removable flag is ignored.");
+    }
+
     const std::wstring image = resolvedImagePath();
-    if (config_.readOnly && !image.empty() && !fileExists(image)) {
-        error = L"The read-only image does not exist: " + image;
+    const bool restore = !image.empty() && fileExists(image);
+    if (config_.readOnly && !restore) {
+        error = image.empty()
+                    ? L"A read-only drive requires an existing image."
+                    : L"The read-only image does not exist: " + image;
         return false;
     }
 
@@ -278,41 +119,11 @@ bool Drive::mount(std::wstring& error) {
     }
     sizeBytes_ = gpu_->size();
 
-    if (!startProxy(error)) {
+    storage_ = std::make_unique<SpdStorage>(
+        *gpu_, config_, sizeBytes_, restore ? image : std::wstring());
+    if (!storage_->mount(error)) {
+        storage_.reset();
         resetStorage();
-        return false;
-    }
-    if (!createDevice(false, error)) {
-        resetStorage();
-        return false;
-    }
-
-    auto cleanupFailedMount = [this]() {
-        if (deviceAttached_) {
-            std::wstring ignored;
-            if (!removeDevice(true, ignored)) {
-                Log::error(L"Unable to remove the failed mount: " + ignored);
-            }
-        }
-        if (!deviceAttached_) {
-            resetStorage();
-        }
-    };
-
-    if (!image.empty() && fileExists(image)) {
-        if (!restoreImage(image, config_.letter, error)) {
-            cleanupFailedMount();
-            return false;
-        }
-    } else {
-        if (!formatVolume(config_.filesystem, config_.label, error)) {
-            cleanupFailedMount();
-            return false;
-        }
-    }
-
-    if (config_.readOnly && !remountReadOnly(error)) {
-        cleanupFailedMount();
         return false;
     }
 
@@ -321,7 +132,10 @@ bool Drive::mount(std::wstring& error) {
     if (config_.useTempFolder) {
         if (!applyTempFolder(config_.letter, error)) {
             std::wstring ignored;
-            unmount(true, ignored);
+            if (storage_) {
+                storage_->unmount(true, ignored);
+            }
+            resetStorage();
             return false;
         }
         ownsTemp_ = true;
@@ -335,7 +149,7 @@ bool Drive::mount(std::wstring& error) {
 
 bool Drive::unmount(bool force, std::wstring& error) {
     error.clear();
-    if (!mounted_ && !gpu_ && !deviceAttached_) {
+    if (!mounted_ && !gpu_ && !storage_) {
         return true;
     }
 
@@ -363,10 +177,10 @@ bool Drive::unmount(bool force, std::wstring& error) {
         }
     }
 
-    if (deviceAttached_) {
-        std::wstring removeError;
-        if (!removeDevice(force, removeError)) {
-            error = removeError + L" The drive was left mounted.";
+    if (storage_) {
+        std::wstring stopError;
+        if (!storage_->unmount(force, stopError)) {
+            error = stopError + L" The drive was left mounted.";
             return false;
         }
     }
@@ -376,14 +190,13 @@ bool Drive::unmount(bool force, std::wstring& error) {
 }
 
 void Drive::resetStorage() {
-    proxy_.stop();
-    if (deviceAttached_) {
-        // The volume still points at this proxy. Never free the backing store
-        // while the driver can still issue requests; leak it instead.
-        Log::error(L"Leaking GPU storage because an ImDisk device is still "
+    if (storage_ && storage_->mounted()) {
+        Log::error(L"Leaking GPU storage because a WinSpd unit is still "
                    L"attached.");
+        storage_.release();
         gpu_.release();
     } else {
+        storage_.reset();
         gpu_.reset();
     }
     mounted_ = false;
@@ -429,7 +242,7 @@ bool Drive::restoreNow(std::wstring& error) {
 bool Drive::formatNow(FileSystem filesystem, const std::wstring& label,
                       std::wstring& error) {
     error.clear();
-    if (!mounted_) {
+    if (!mounted_ || !storage_) {
         error = L"The drive is not mounted.";
         return false;
     }
@@ -437,7 +250,7 @@ bool Drive::formatNow(FileSystem filesystem, const std::wstring& label,
         error = L"A read-only drive cannot be formatted.";
         return false;
     }
-    if (!formatVolume(filesystem, label, error)) {
+    if (!storage_->format(filesystem, label, error)) {
         return false;
     }
     config_.filesystem = filesystem;
@@ -452,7 +265,7 @@ DriveStatus Drive::status() const {
     result.sizeBytes = sizeBytes_;
     if (gpu_) {
         result.directMapped = gpu_->directMapped();
-        result.backend = gpu_->info();
+        result.backend = L"WinSpd / " + gpu_->info();
     }
     return result;
 }

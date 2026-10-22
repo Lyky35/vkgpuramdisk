@@ -169,6 +169,10 @@ bool DriveManager::addOrUpdate(const DriveConfig& config, std::wstring& error) {
         error = L"C: is reserved for the system drive.";
         return false;
     }
+    if (config.readOnly && config.imagePath.empty()) {
+        error = L"A read-only drive requires an image.";
+        return false;
+    }
 
     const wchar_t letter = static_cast<wchar_t>(
         towupper(static_cast<wint_t>(config.letter)));

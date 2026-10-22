@@ -10,9 +10,10 @@
 
 namespace grd {
 
-// The ImDisk side of a shared-memory proxy drive. The driver writes a request
-// into shared memory, signals _Request, and waits for _Response. This class
-// owns those named objects and the worker that answers them.
+// Legacy shared-memory proxy used only by the benchmark harness. The
+// application uses WinSpd instead. The driver side writes a request into
+// shared memory, signals _Request, and waits for _Response. This class owns
+// those named objects and the worker that answers them.
 class ProxyServer {
 public:
     using ReadHandler =

@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-#include "core/proxy_protocol.h"
-#include "core/proxy_server.h"
+#include "legacy_proxy_protocol.h"
+#include "legacy_proxy_server.h"
 #include "gpu/vulkan_drive.h"
 #include "gpu/vulkan_runtime.h"
 
@@ -119,7 +119,8 @@ void printUsage() {
         "  --proxy-only  benchmark only the shared-memory proxy path\n"
         "  --help        show this help\n"
         "\n"
-        "The proxy benchmark requires the same privileges as a mounted drive.\n"
+        "The proxy benchmark is a legacy in-process measurement, not the\n"
+        "WinSpd path. It requires the same privileges as a mounted drive.\n"
         "Set GPURAMDRIVE_FORCE_STAGING=1 to compare the staging path.\n");
 }
 

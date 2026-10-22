@@ -1,24 +1,27 @@
 # GpuRamDriveVk
 
 GpuRamDriveVk is a Vulkan-backed RAM disk for Windows. It allocates a flat
-block of GPU device memory and exposes it to Windows through ImDisk's
-shared-memory proxy driver. Drives appear as normal volumes and can be
+block of GPU device memory and presents it to Windows through
+[WinSpd](https://github.com/winfsp/winspd), a signed Storport virtual miniport
+with a user-mode storage backend. Drives appear as normal volumes and can be
 formatted, mounted, unmounted, saved to raw images, and mounted again.
 
 This is a clean-room rewrite of GpuRamDrive with a C++20 code base, a Win32
-GUI, a command-line front end, and a Vulkan backend that does not require the
-Vulkan SDK at build time or `vulkan-1.lib` at run time. Vulkan and ImDisk are
-loaded dynamically.
+GUI, a command-line front end, and a dynamically loaded Vulkan backend. WinSpd
+and the Vulkan loader are resolved at run time.
 
 ## Requirements
 
 - Windows 10 or later, x64.
-- The [ImDisk Virtual Disk Driver](https://www.ltr-data.se/opencode.html),
-  including `imdisk.cpl`.
+- [WinSpd 1.0B1](https://github.com/winfsp/winspd/releases/tag/v1.0B1),
+  including the WinSpd driver. GpuRamDriveVk does not bundle the driver.
 - A Vulkan-capable GPU driver. The Vulkan loader (`vulkan-1.dll`) must be
   installed by the graphics driver.
 - Administrator rights. The GUI manifest requests elevation; the CLI checks
   for elevation before privileged operations.
+
+WinSpd is licensed under GPLv3 with a special exception for Free/Libre and
+Open Source Software. See [Third-party notices](#third-party-notices).
 
 ## Building
 
@@ -35,8 +38,8 @@ Outputs:
 
 - `build/gpuvramdrive.exe` — GUI, `requireAdministrator`.
 - `build/gpuvramdrive-cli.exe` — CLI, `asInvoker` plus explicit elevation checks.
-- `build/gpuvramdisk-bench.exe` — raw Vulkan and shared-memory proxy benchmark.
-  See `docs/PERFORMANCE.md` for the measurement method and current findings.
+- `build/gpuvramdisk-bench.exe` — raw Vulkan and legacy shared-memory proxy
+  benchmark. See `docs/PERFORMANCE.md`.
 
 Dependencies: CMake 3.20+, a C++20 MinGW-w64 toolchain, and the Vulkan headers
 under `third_party/Vulkan-Headers/include`. The executables do not import
@@ -70,13 +73,16 @@ autostart-task on|off|status
 
 `add` supports `--size` (MiB), `--gpu`, `--fs` (`NTFS`, `exFAT`, `FAT32`),
 `--label`, `--image`, `--type hd|fd`, `--removable`, `--read-only`, `--temp`,
-and `--autostart`.
+and `--autostart`. The `--type` and `--removable` options are retained for
+configuration compatibility; WinSpd always exposes a fixed SCSI disk.
+`--read-only` requires an existing image.
 
-`mount R` and `autostart` are foreground processes: the shared-memory proxy
+`mount R` and `autostart` are foreground processes: the WinSpd storage unit
 must stay alive while the volume is mounted. Press Ctrl+C, or run
 `unmount R` from another elevated terminal, to save the image (if configured)
-and unmount. If a normal unmount is blocked by open files, the CLI does not
-force it; unmount the drive from the GUI or close the files first.
+and unmount. If the image save fails, a non-forced unmount leaves the drive
+mounted so the data is not lost. Stopping the WinSpd unit itself removes the
+volume; close open files first.
 
 `unmount` only signals a foreground CLI mount process. Drives mounted by the
 GUI must be unmounted from the GUI. When an `autostart` process is handling
@@ -94,12 +100,16 @@ Each `[drive.X]` section stores the drive letter, GPU index, size, filesystem,
 device type, label, image path, and flags. Logs are written to
 `gpuvramdrive.log` in the same directory.
 
-A drive with an `image` path restores that raw image on mount and saves it on
-a normal unmount. Image saves are written to `<image>.tmp` and atomically
-replaced, so a failed save does not destroy the previous image. Relative image
-paths are resolved against the executable directory. A read-only drive with an image path refuses to mount when the
-image is missing. Read-only drives without an image start as a blank
-formatted volume and discard changes on unmount.
+A drive with an `image` path restores that raw volume image on mount and saves
+it on a normal unmount. Images contain the filesystem payload, not the MBR;
+the image is restored at the 1 MiB partition offset. Image saves are written to
+`<image>.tmp` and atomically replaced, so a failed save does not destroy the
+previous image. Relative image paths are resolved against the executable
+directory.
+
+A read-only drive requires an existing image and is mounted with WinSpd's
+write-protect flag. The storage callback also rejects writes. A blank
+read-only volume is not supported.
 
 The `temp` option creates `<letter>:\Temp`, points `HKCU\Environment\TEMP` and
 `TMP` at it, and restores the previous values on unmount. Only one mounted
@@ -110,32 +120,49 @@ Drive `C:` is reserved and is never accepted.
 
 ## Architecture
 
-- `src/core/` — configuration, logging, ImDisk API binding, shared-memory
-  proxy server, image I/O, TEMP redirection, Task Scheduler integration, and
-  drive lifecycle.
+- `src/spd/` — minimal WinSpd ABI, dynamic DLL loading, and export resolution.
+- `src/core/` — configuration, logging, WinSpd storage lifecycle, image I/O,
+  TEMP redirection, Task Scheduler integration, and drive lifecycle.
 - `src/gpu/` — dynamically resolved Vulkan API, device enumeration, and
-  device-memory storage.
+  device-memory storage with concurrent I/O contexts.
 - `src/gui/` — Win32 GUI and notification-area integration.
 - `src/cli/` — command-line front end.
+- `tools/` — benchmark harness and its benchmark-only legacy proxy.
 - `resources/` — application icons.
+- `third_party/Vulkan-Headers/` — Vulkan headers used only for compilation.
 
 The logon task launches `gpuvramdrive.exe --autostart` when the GUI is next to
 the registering executable, otherwise it falls back to the CLI.
-- `third_party/Vulkan-Headers/` — Vulkan headers used only for compilation.
+
+### Storage path
+
+```text
+filesystem IRP
+  -> WinSpd Storport miniport
+  -> user-mode dispatcher threads (8 by default)
+  -> Vulkan copy/submit/fence wait, or a CPU copy on the direct-mapped path
+  -> GPU memory
+```
+
+`SpdStorage` writes an MBR with a 1 MiB partition start and an NTFS/exFAT or
+FAT32 partition type, creates the WinSpd unit, starts its dispatcher, and waits
+for the disk to appear. New volumes are
+formatted and assigned with `diskpart`; restored images are assigned without
+formatting. WinSpd is configured with a 4 MiB maximum transfer, no UNMAP, no
+write cache, and a fixed product ID (`GpuRamDrive-<letter>`) so the correct
+physical disk can be found.
 
 On GPUs where device-local memory is host-visible, the drive is mapped
-directly. Otherwise it uses 256 MiB device-local segments and a 4 MiB
-host-visible staging buffer per transfer. Direct-mapped discrete GPUs keep
-direct writes but stage reads through the GPU copy engine, because uncached
-BAR reads can be extremely slow. Set `GPURAMDRIVE_FORCE_STAGING=1` to force the
-staging path for testing, or use `GPURAMDRIVE_DIRECT_READS=1` /
-`GPURAMDRIVE_STAGED_READS=1` to override the read policy.
+directly. Otherwise it uses device-local segments and a host-visible staging
+buffer per transfer. Direct-mapped discrete GPUs keep direct writes but stage
+reads through the GPU copy engine, because uncached BAR reads can be extremely
+slow. Set `GPURAMDRIVE_FORCE_STAGING=1` to force the staging path for testing,
+or use `GPURAMDRIVE_DIRECT_READS=1` / `GPURAMDRIVE_STAGED_READS=1` to override
+the read policy. `GPURAMDRIVE_IO_CONTEXTS` controls the Vulkan I/O context pool
+(default 8, clamped to 1–32).
 
-The ImDisk wire protocol is the standard 4096-byte shared-memory header plus a
-4 MiB data area. The proxy reports 512-byte request alignment because the
-Vulkan staging path uses buffer copies and Windows storage I/O is
-sector-aligned. Read, write, info, and close requests are supported; unknown
-requests return `ENODEV`. UNMAP/ZERO are not advertised.
+The legacy shared-memory proxy remains compiled only for
+`gpuvramdisk-bench`; the application no longer uses it.
 
 ## Verification
 
@@ -145,27 +172,39 @@ example Mesa lavapipe):
 ```sh
 WINEPREFIX="$HOME/.wine-grd-test" wine build/gpuvramdrive-cli.exe gpus
 WINEPREFIX="$HOME/.wine-grd-test" wine build/gpuvramdrive-cli.exe status
+WINEPREFIX="$HOME/.wine-grd-test" wine build/gpuvramdisk-bench.exe --raw-only
 ```
 
-The GPU allocation path, direct and forced-staging paths, and the proxy
-protocol (info/write/read/close, alignment, bounds, and unknown-request
-handling) have been exercised with a software Vulkan device. Full ImDisk mount, format,
-image, TEMP, and Task Scheduler behavior requires a real elevated Windows
-host with ImDisk installed.
+Wine is only a functional smoke test. A WinSpd mount, `diskpart` format,
+drive-letter assignment, image restore, TEMP, and Task Scheduler behavior
+require an elevated real Windows host with the WinSpd driver installed.
 
 ## Limitations
 
+- WinSpd 1.0B1 is a beta release. Current Windows 11 compatibility and driver
+  signing are not guaranteed.
 - GPU memory is not a replacement for system RAM; a GPU reset or driver
   timeout can lose the entire drive.
-- The volume depends on the GUI or CLI process staying alive. If the process
-  is killed, the ImDisk volume can be left in a failed state; unmount or
-  reboot before reusing the letter.
+- The volume depends on the GUI or CLI process staying alive. If the process is
+  killed, the WinSpd unit can be removed with unflushed data; unmount or reboot
+  before reusing the letter.
 - There is no journaling, encryption, or crash recovery beyond the optional
   raw image.
-- A read-only drive is created from a writable temporary mount and then
-  re-mounted read-only; do not rely on this as a security boundary.
+- Read-only is enforced by the WinSpd unit and the storage callback, but it is
+  not an encryption or access-control boundary.
 - The code is intended for Windows 10+ x64. The checked-in manifest is amd64.
+
+## Third-party notices
+
+WinSpd - Windows Storage Proxy Driver, Copyright (C) Bill Zissimopoulos
+
+<https://github.com/winfsp/winspd>
+
+WinSpd is licensed under GPLv3 with a special exception for Free/Libre and
+Open Source Software. See the
+[WinSpd license](https://github.com/winfsp/winspd/blob/master/License.txt) and
+`THIRD_PARTY_NOTICES.md`.
 
 ## License
 
-MIT. See the repository `LICENSE`.
+GpuRamDriveVk is MIT licensed. See the repository `LICENSE`.
